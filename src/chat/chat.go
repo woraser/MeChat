@@ -1,10 +1,7 @@
 package chat
-
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/gobwas/ws"
-	"github.com/gobwas/ws/wsutil"
 	"gopool"
 	"io"
 	"math/rand"
@@ -13,23 +10,74 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
 )
 
+// User represents user connection.
+// It contains logic of receiving and sending messages.
+// That is, there are no active reader or writer. Some other layer of the
+// application should call Receive() to read user's incoming message.
 type User struct {
 	io   sync.Mutex
 	conn io.ReadWriteCloser
+
 	id   uint
 	name string
 	chat *Chat
 }
 
+// Receive reads next message from user's underlying connection.
+// It blocks until full message received.
 func (u *User) Receive() error {
+	req, err := u.readRequest()
+	if err != nil {
+		u.conn.Close()
+		return err
+	}
+	if req == nil {
+		// Handled some control message.
+		return nil
+	}
+	switch req.Method {
+	case "rename":
+		name, ok := req.Params["name"].(string)
+		if !ok {
+			return u.writeErrorTo(req, Object{
+				"error": "bad params",
+			})
+		}
+		prev, ok := u.chat.Rename(u, name)
+		if !ok {
+			return u.writeErrorTo(req, Object{
+				"error": "already exists",
+			})
+		}
+		u.chat.Broadcast("rename", Object{
+			"prev": prev,
+			"name": name,
+			"time": timestamp(),
+		})
+		return u.writeResultTo(req, nil)
+	case "publish":
+		req.Params["author"] = u.name
+		req.Params["time"] = timestamp()
+		u.chat.Broadcast("publish", req.Params)
+	default:
+		return u.writeErrorTo(req, Object{
+			"error": "not implemented",
+		})
+	}
 	return nil
 }
 
+// readRequests reads json-rpc request from connection.
+// It takes io mutex.
 func (u *User) readRequest() (*Request, error) {
 	u.io.Lock()
 	defer u.io.Unlock()
+
 	h, r, err := wsutil.NextReader(u.conn, ws.StateServerSide)
 	if err != nil {
 		return nil, err
@@ -43,6 +91,7 @@ func (u *User) readRequest() (*Request, error) {
 	if err := decoder.Decode(req); err != nil {
 		return nil, err
 	}
+
 	return req, nil
 }
 
@@ -70,23 +119,27 @@ func (u *User) writeNotice(method string, params Object) error {
 func (u *User) write(x interface{}) error {
 	w := wsutil.NewWriter(u.conn, ws.StateServerSide, ws.OpText)
 	encoder := json.NewEncoder(w)
+
 	u.io.Lock()
 	defer u.io.Unlock()
+
 	if err := encoder.Encode(x); err != nil {
 		return err
 	}
+
 	return w.Flush()
 }
 
 func (u *User) writeRaw(p []byte) error {
 	u.io.Lock()
 	defer u.io.Unlock()
+
 	_, err := u.conn.Write(p)
+
 	return err
 }
 
-//chat
-
+// Chat contains logic of user interaction.
 type Chat struct {
 	mu  sync.RWMutex
 	seq uint
@@ -103,25 +156,31 @@ func NewChat(pool *gopool.Pool) *Chat {
 		ns:   make(map[string]*User),
 		out:  make(chan []byte, 1),
 	}
-	go chat.write()
+
+	go chat.writer()
 
 	return chat
 }
 
+// Register registers new connection as a User.
 func (c *Chat) Register(conn net.Conn) *User {
 	user := &User{
 		chat: c,
 		conn: conn,
 	}
+
 	c.mu.Lock()
 	{
 		user.id = c.seq
 		user.name = c.randName()
+
 		c.us = append(c.us, user)
 		c.ns[user.name] = user
+
 		c.seq++
 	}
 	c.mu.Unlock()
+
 	user.writeNotice("hello", Object{
 		"name": user.name,
 	})
@@ -129,22 +188,27 @@ func (c *Chat) Register(conn net.Conn) *User {
 		"name": user.name,
 		"time": timestamp(),
 	})
+
 	return user
 }
 
+// Remove removes user from chat.
 func (c *Chat) Remove(user *User) {
 	c.mu.Lock()
 	removed := c.remove(user)
 	c.mu.Unlock()
+
 	if !removed {
 		return
 	}
+
 	c.Broadcast("goodbye", Object{
 		"name": user.name,
 		"time": timestamp(),
 	})
 }
 
+// Rename renames user.
 func (c *Chat) Rename(user *User, name string) (prev string, ok bool) {
 	c.mu.Lock()
 	{
@@ -156,13 +220,17 @@ func (c *Chat) Rename(user *User, name string) (prev string, ok bool) {
 		}
 	}
 	c.mu.Unlock()
+
 	return prev, ok
 }
 
+// Broadcast sends message to all alive users.
 func (c *Chat) Broadcast(method string, params Object) error {
 	var buf bytes.Buffer
+
 	w := wsutil.NewWriter(&buf, ws.StateServerSide, ws.OpText)
 	encoder := json.NewEncoder(w)
+
 	r := Request{Method: method, Params: params}
 	if err := encoder.Encode(r); err != nil {
 		return err
@@ -170,17 +238,21 @@ func (c *Chat) Broadcast(method string, params Object) error {
 	if err := w.Flush(); err != nil {
 		return err
 	}
+
 	c.out <- buf.Bytes()
+
 	return nil
 }
 
-func (c *Chat) write() {
+// writer writes broadcast messages from chat.out channel.
+func (c *Chat) writer() {
 	for bts := range c.out {
-		c.mu.Lock()
+		c.mu.RLock()
 		us := c.us
-		c.mu.Unlock()
+		c.mu.RUnlock()
+
 		for _, u := range us {
-			u := u //for closeure
+			u := u // For closure.
 			c.pool.Schedule(func() {
 				u.writeRaw(bts)
 			})
@@ -188,26 +260,29 @@ func (c *Chat) write() {
 	}
 }
 
-//从用户信息集合中删除指定用户 并且重组用户信息
+// mutex must be held.
 func (c *Chat) remove(user *User) bool {
 	if _, has := c.ns[user.name]; !has {
 		return false
 	}
+
 	delete(c.ns, user.name)
+
 	i := sort.Search(len(c.us), func(i int) bool {
 		return c.us[i].id >= user.id
 	})
 	if i >= len(c.us) {
-		panic("chat:inconsistent state")
+		panic("chat: inconsistent state")
 	}
+
 	without := make([]*User, len(c.us)-1)
 	copy(without[:i], c.us[:i])
 	copy(without[i:], c.us[i+1:])
 	c.us = without
+
 	return true
 }
 
-//get unique name for names [animals]
 func (c *Chat) randName() string {
 	var suffix string
 	for {
@@ -220,7 +295,6 @@ func (c *Chat) randName() string {
 	return ""
 }
 
-//get unix time
 func timestamp() int64 {
 	return time.Now().UnixNano() / int64(time.Millisecond)
 }
